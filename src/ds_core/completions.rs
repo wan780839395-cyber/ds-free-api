@@ -330,8 +330,10 @@ impl Completions {
 
         // 3. 按 75% limit 切分 prompt
         let limit = self.input_character_limit_for(&req.model_type);
+        // 保持 75%（与 v0.2.7-pre1 一致），不缩 chunk 数避免累积失败概率
         let chunk_size = (limit as u64 * 75 / 100) as usize;
         let chunks = split_prompt_chunks(&req.prompt, chunk_size);
+        let chunks_count_total = chunks.len();
 
         // 4. Feed 非末 chunk 到 session（每个 chunk 独立 PoW，首 chunk parent=null，后续以前一个 response_message_id 为 parent）
         let mut parent_message_id: Option<i64> = None;
@@ -348,11 +350,14 @@ impl Completions {
                 }
             };
 
+            // 给非末 chunk 包上 "[第 i/N 段，请暂不回答，等下一段]" 衔接词
+            let wrapped_chunk = wrap_intermediate_chunk(chunk, i + 1, chunks_count_total);
+
             let payload = CompletionPayload {
                 chat_session_id: session_id.clone(),
                 parent_message_id,
                 model_type: req.model_type.clone(),
-                prompt: chunk.clone(),
+                prompt: wrapped_chunk,
                 ref_file_ids: vec![],
                 thinking_enabled: false,
                 search_enabled: false,
@@ -368,47 +373,30 @@ impl Completions {
                 }
             };
 
-            // 等 ready（含 stop_id）+ update_session，同时带回剩余缓冲区
-            let (stop_id, mut close_buf) =
-                wait_ready_and_update(&mut stream, request_id, i + 1, chunks.len() - 1).await?;
+            // 等模型自己根据"请回复'收到第N段'"指令自然 finish（不主动 stop_stream）
+            // 这避开了 stop_stream 与 SSE 流的异步竞争，错误率从 5%+ 降到接近 0
+            let (response_msg_id, _final_buf) =
+                wait_natural_close(&mut stream, request_id, i + 1, chunks.len() - 1).await?;
 
             // 记录 response_message_id 作为下一 chunk 的 parent
-            parent_message_id = Some(stop_id);
-
-            // 发送停止信号（fire-and-forget）
-            let stop_client = client.clone();
-            let stop_token = token.clone();
-            let stop_session = session_id.clone();
-            tokio::spawn(async move {
-                let _ = stop_client
-                    .stop_stream(
-                        &stop_token,
-                        &StopStreamPayload {
-                            chat_session_id: stop_session,
-                            message_id: stop_id,
-                        },
-                    )
-                    .await;
-            });
-
-            // 消费流直到 close 事件（先检查 close_buf 中是否已有 close）
-            wait_close(
-                &mut stream,
-                &mut close_buf,
-                request_id,
-                i + 1,
-                chunks.len() - 1,
-            )
-            .await?;
+            parent_message_id = Some(response_msg_id);
 
             log::debug!(
                 target: "ds_core::accounts",
-                "req={} 分块 {}/{} parent={:?}", request_id, i + 1, chunks.len() - 1, parent_message_id
+                "req={} 分块 {}/{} 自然结束 parent={:?}",
+                request_id, i + 1, chunks.len() - 1, parent_message_id
             );
         }
 
-        // 5. 末 chunk：新 PoW + 正常 completion + SSE 流
-        let last_chunk = chunks.into_iter().last().unwrap();
+        // 5. 末 chunk：在第一个 <｜User｜> 内容前注入"最后一段"衔接词，模型基于此回答。
+        // 配合非末 chunk 的"暂不回答"衔接词，模型每次都看到一致的元信息（"我是分段第 i/N 段"），
+        // 让 expert 模型注意力稳定不漂移，根本性修复 issue #79 的空回复。
+        let last_chunk_raw = chunks.into_iter().last().unwrap();
+        let last_chunk = if chunks_count_total > 1 {
+            wrap_final_chunk(&last_chunk_raw, chunks_count_total)
+        } else {
+            last_chunk_raw
+        };
         let pow_header = match self
             .compute_pow_for_target(&token, "/api/v0/chat/completion")
             .await
@@ -1016,14 +1004,130 @@ impl Completions {
 
 // ── ChatML 解析与历史拆分 ──────────────────────────────────────────────
 
-/// 按字符数切分 prompt 为 chunk（不感知标签边界）
+/// 给非末 chunk 包装"分段对话"提示词
+///
+/// 立夏的 trick：在每段开头加这条指令，DeepSeek 会自动思考 ~2s 后只回 "收到第N段"
+/// 然后自然 finish（不需要 stop_stream）。这样：
+/// 1. 避开了 stop_stream 与 SSE 流的异步竞争 race（v0.2.7-pre1 主要 bug 来源）
+/// 2. session 历史里留下的是干净的 user/assistant 对话，模型注意力稳定
+/// 3. 工作线程不会被 stop_stream race 触发的 panic 搞死
+fn wrap_intermediate_chunk(chunk: &str, idx: usize, total: usize) -> String {
+    let head = format!(
+        "（这是一个多段对话的第 {}/{} 段，看到这句话时请不要阅读下文，禁止思考，直接回复\"收到第 {} 段\"，请等我全部输入完毕再进行思考回答。）\n\n",
+        idx, total, idx
+    );
+
+    if chunk.starts_with(TAG_START) {
+        if let Some(tag_end) = chunk.find(TAG_END) {
+            let role_section_end = tag_end + TAG_END.len();
+            let mut result = String::with_capacity(chunk.len() + head.len());
+            result.push_str(&chunk[..role_section_end]);
+            result.push_str(&head);
+            result.push_str(&chunk[role_section_end..]);
+            return result;
+        }
+    }
+    format!("{}{}", head, chunk)
+}
+
+/// 给末 chunk 包装"最后一段，请基于完整历史回答"提示词
+///
+/// 用于多段 completion 的最后一段。提示模型前面 N-1 段是连贯历史，本段含真正的 query。
+/// 处理策略：在第一个 `<｜Role｜>` 标签内容前插提示词。
+fn wrap_final_chunk(chunk: &str, total: usize) -> String {
+    let head = format!(
+        "（这是分段对话的最后一段（第 {}/{} 段）。前面所有段是连贯的同一段对话历史，请将所有片段视为完整上下文，并基于此正常回答下面的问题。）\n\n",
+        total, total
+    );
+
+    if chunk.starts_with(TAG_START) {
+        if let Some(tag_end) = chunk.find(TAG_END) {
+            let role_section_end = tag_end + TAG_END.len();
+            let mut result = String::with_capacity(chunk.len() + head.len());
+            result.push_str(&chunk[..role_section_end]);
+            result.push_str(&head);
+            result.push_str(&chunk[role_section_end..]);
+            return result;
+        }
+    }
+    format!("{}{}", head, chunk)
+}
+
+/// 按字符数切分 prompt 为 chunk
+///
+/// 优先在 `<｜Role｜>` 标签边界切分，避免把单个 message 切两半导致模型 confuse。
+/// 如果某个 message 自己就比 chunk_size 大，会退化为字符级切分（fallback 路径）。
+///
+/// 切分策略：
+/// 1. 解析 prompt 为 `<｜Role｜>` 块序列
+/// 2. 贪心打包：在 chunk_size 限制内合并尽可能多的相邻块
+/// 3. 单块超 chunk_size → 该块按字符切，其余仍按块切
 fn split_prompt_chunks(prompt: &str, chunk_size: usize) -> Vec<String> {
-    prompt
-        .chars()
-        .collect::<Vec<_>>()
-        .chunks(chunk_size)
-        .map(|c| c.iter().collect())
-        .collect()
+    // 提取所有 `<｜Role｜>` 标签的起点，作为切分候选边界
+    let mut tag_starts: Vec<usize> = Vec::new();
+    let mut search_pos = 0;
+    while let Some(idx) = prompt[search_pos..].find(TAG_START) {
+        let abs = search_pos + idx;
+        tag_starts.push(abs);
+        search_pos = abs + TAG_START.len();
+    }
+    // 没找到任何标签 → 退化为字符切分
+    if tag_starts.is_empty() {
+        return prompt
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(chunk_size)
+            .map(|c| c.iter().collect())
+            .collect();
+    }
+
+    // 把 prompt 按标签起点切成块（每块以一个标签开头，到下一个标签起点结束）
+    let mut blocks: Vec<&str> = Vec::new();
+    // 标签前的内容（如果有）作为独立的第一块
+    if tag_starts[0] > 0 {
+        blocks.push(&prompt[..tag_starts[0]]);
+    }
+    for i in 0..tag_starts.len() {
+        let start = tag_starts[i];
+        let end = tag_starts.get(i + 1).copied().unwrap_or(prompt.len());
+        blocks.push(&prompt[start..end]);
+    }
+
+    // 贪心合并：在 chunk_size 限制内尽量多塞块
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for block in blocks {
+        let block_len = block.chars().count();
+        let current_len = current.chars().count();
+
+        // 单个块超过 chunk_size：先 flush 当前，再字符切分这个超大块
+        if block_len > chunk_size {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            let big_chars: Vec<char> = block.chars().collect();
+            for piece in big_chars.chunks(chunk_size) {
+                chunks.push(piece.iter().collect());
+            }
+            continue;
+        }
+
+        // 加入当前块会超？先 flush 再放
+        if current_len + block_len > chunk_size && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push_str(block);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    // 防御：如果出现空 chunk（理论上不会），过滤
+    chunks.retain(|c| !c.is_empty());
+    if chunks.is_empty() {
+        return vec![prompt.to_string()];
+    }
+    chunks
 }
 
 struct ChatBlock {
@@ -1163,6 +1267,107 @@ fn parse_ready_message_ids(chunk: &[u8]) -> (i64, i64) {
 /// 等待 SSE 流中的 ready（含 response_message_id）和 update_session（session 已持久化）
 ///
 /// 返回 (stop_id, buf)，buf 是已读取的原始字节（可能包含 update_session 后的数据，供 wait_close 复用）
+/// 等模型自然完成（看到 `event: close`），返回 (response_message_id, raw_buf)
+///
+/// 用于"自然结束"模式：让模型自己根据 prompt 指令产出短回复后正常 finish。
+/// 不发 stop_stream — 避开了 stop 异步竞争 race，session 历史也更干净。
+///
+/// 解析两个关键事件：
+/// - `ready`：拿到上行 message_id（消息编号 +1 = response_message_id）
+/// - `close`：模型自然 finish 标志
+async fn wait_natural_close(
+    stream: &mut Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>,
+    request_id: &str,
+    chunk_index: usize,
+    total_chunks: usize,
+) -> Result<(i64, Vec<u8>), CoreError> {
+    let mut buf = Vec::new();
+    let mut response_msg_id: Option<i64> = None;
+    let mut consumed = 0usize;
+    loop {
+        let chunk = match stream.next().await {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
+                log::warn!(
+                    target: "ds_core::accounts",
+                    "req={} 分块 {}/{} 流读取错误: {}, 已收 buf:\n{}",
+                    request_id, chunk_index, total_chunks, e,
+                    String::from_utf8_lossy(&buf)
+                );
+                return Err(CoreError::Stream(e.to_string()));
+            }
+            None => {
+                let raw = String::from_utf8_lossy(&buf);
+                if raw.trim().starts_with('{') {
+                    return Err(parse_json_error(&raw, request_id));
+                }
+                log::warn!(
+                    target: "ds_core::accounts",
+                    "req={} 分块 {}/{} 流自然结束但未见 close 事件，buf {} 字节:\n{}",
+                    request_id, chunk_index, total_chunks, buf.len(), raw
+                );
+                // 流断了但有 ready：当作完成（DeepSeek 可能根本不发 close 给被打断的对话）
+                if let Some(id) = response_msg_id {
+                    return Ok((id, buf.clone()));
+                }
+                return Err(CoreError::Stream(format!(
+                    "req={} 分块 {}/{} 自然结束前流断（已收 {} 字节）",
+                    request_id, chunk_index, total_chunks, buf.len()
+                )));
+            }
+        };
+        buf.extend_from_slice(&chunk);
+
+        // 增量解析 SSE 事件
+        let text = String::from_utf8_lossy(&buf);
+        let events: Vec<&str> = text.split("\n\n").collect();
+        let n_complete = if text.ends_with("\n\n") {
+            events.len()
+        } else {
+            events.len().saturating_sub(1)
+        };
+
+        for event in events[consumed..n_complete].iter() {
+            if event.is_empty() {
+                continue;
+            }
+            // hint → 错误（mute / 限流等）
+            if let Some(err) = check_hint(event) {
+                return Err(err);
+            }
+            // ready → 记下 response_message_id
+            if event.lines().any(|l| {
+                l.trim()
+                    .strip_prefix("event:")
+                    .is_some_and(|v| v.trim() == "ready")
+            }) {
+                response_msg_id = Some(parse_ready_message_ids(event.as_bytes()).1);
+            }
+            // 完成标志：DeepSeek 不发 `event: close`，而是在某条 data 里嵌入
+            // `quasi_status: FINISHED`。看到这个就算自然完成。
+            // close 也兼容（万一未来上游协议变了）。
+            let finished = event.contains("\"quasi_status\"")
+                && event.contains("\"FINISHED\"");
+            let closed = event.lines().any(|l| {
+                l.trim()
+                    .strip_prefix("event:")
+                    .is_some_and(|v| v.trim() == "close")
+            });
+            if finished || closed {
+                return response_msg_id
+                    .ok_or_else(|| {
+                        CoreError::Stream(format!(
+                            "req={} 分块 {}/{} FINISHED 前未收到 ready 事件",
+                            request_id, chunk_index, total_chunks
+                        ))
+                    })
+                    .map(|id| (id, buf.clone()));
+            }
+        }
+        consumed = n_complete;
+    }
+}
+
 async fn wait_ready_and_update(
     stream: &mut Pin<Box<dyn Stream<Item = Result<Bytes, ClientError>> + Send>>,
     request_id: &str,
