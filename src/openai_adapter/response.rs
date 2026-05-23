@@ -77,6 +77,20 @@ fn find_stop_pos(content: &str, stop: &[String]) -> Option<usize> {
     stop.iter().filter_map(|s| content.find(s)).min()
 }
 
+/// 找到 <= idx 的最近 char 边界（不在多字节字符中间）
+///
+/// 等价于 nightly 的 str::floor_char_boundary，但稳定可用。
+/// 用于多语言场景（中文 / 日文 / 俄文）下安全切片，避免 byte index 落在 UTF-8 续字节上。
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 /// RepairStream 内部使用的流类型
 type ChunkStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionsResponseChunk, OpenAIAdapterError>> + Send>>;
@@ -341,7 +355,13 @@ where
                         this.buffer.push_str(content);
                         if let Some(pos) = find_stop_pos(this.buffer, this.stop) {
                             trace!(target: "adapter", ">>> stop: truncate at {}", pos);
-                            let truncated = &this.buffer[*this.sent_len..pos];
+                            // 防御：sent_len 可能 > pos（多语言 / chunk 边界 / stop 字符串跨段）
+                            // 此时已发出的内容已超过 stop 位置，没有新内容可发，避免 panic
+                            let safe_start = (*this.sent_len).min(pos);
+                            // 同时确保 byte 边界落在 char boundary 上（多字节字符）
+                            let safe_start = floor_char_boundary(this.buffer, safe_start);
+                            let safe_end = floor_char_boundary(this.buffer, pos);
+                            let truncated = &this.buffer[safe_start..safe_end];
                             if truncated.is_empty() {
                                 choice.delta.content = None;
                             } else {
