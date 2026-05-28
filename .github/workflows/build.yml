@@ -1,53 +1,39 @@
-name: Build My EXE
+name: Build Linux Binary
 on: [push, workflow_dispatch]
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build-linux:
+    runs-on: ubuntu-latest # 👈 让 GitHub 用 Linux 服务器帮我们编
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 👇 【新增步骤】安装 Node.js 环境用来打包前端网页
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-size: 20
-          cache-dependency-path: web/package-lock.json
+          node-version: 20
 
-      # 👇 【新增步骤】去 web 目录下把前端打包出来，生成 dist/ 目录
       - name: Build Frontend Web
         run: |
           cd web
           npm install
           npm run build
 
-      - name: Install NASM
-        run: choco install nasm
-
-      - name: Install Perl
-        run: choco install strawberryperl
-
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-          target: x86_64-pc-windows-msvc
 
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake perl pkg-config libssl-dev
 
       - name: Run Build
         run: cargo build --release
 
-      - name: Upload EXE Artifact
+      - name: Upload Linux Binary
         uses: actions/upload-artifact@v4
         with:
-          name: my-fixed-api
-          path: target/release/ds-free-api.exe
+          name: my-fixed-linux-binary
+          path: target/release/ds-free-api # 👈 注意：Linux 编译产物没有 .exe 后缀
