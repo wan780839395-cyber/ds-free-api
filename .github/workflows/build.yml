@@ -1,5 +1,5 @@
 name: Build My EXE
-on: [push, workflow_dispatch] # 支持手动点击触发
+on: [push, workflow_dispatch]
 
 jobs:
   build-windows:
@@ -7,6 +7,20 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # 👇 【新增步骤】安装 Node.js 环境用来打包前端网页
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-size: 20
+          cache-dependency-path: web/package-lock.json
+
+      # 👇 【新增步骤】去 web 目录下把前端打包出来，生成 dist/ 目录
+      - name: Build Frontend Web
+        run: |
+          cd web
+          npm install
+          npm run build
 
       - name: Install NASM
         run: choco install nasm
